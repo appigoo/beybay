@@ -179,11 +179,11 @@ def get_valid_token() -> str | None:
 # ─────────────────────────────────────────────
 # eBay API 調用
 # ─────────────────────────────────────────────
-def ebay_get(endpoint: str) -> dict:
-    """通用 GET 請求"""
+def ebay_get(endpoint: str) -> tuple:
+    """通用 GET 請求，回傳 (data, status_code)"""
     token = get_valid_token()
     if not token:
-        return {"error": "未授權"}
+        return {"error": "未授權"}, 401
 
     response = requests.get(
         f"{EP['api']}{endpoint}",
@@ -193,36 +193,45 @@ def ebay_get(endpoint: str) -> dict:
         },
         timeout=15,
     )
-    return response.json()
+    try:
+        return response.json(), response.status_code
+    except Exception:
+        return {"raw": response.text}, response.status_code
 
-def ebay_post(endpoint: str, body: dict) -> dict:
-    """通用 POST 請求"""
+def ebay_put(endpoint: str, body: dict) -> tuple:
+    """通用 PUT 請求（eBay Inventory API 用 PUT 建立/更新）"""
     token = get_valid_token()
     if not token:
-        return {"error": "未授權"}
+        return {"error": "未授權"}, 401
 
-    response = requests.post(
+    response = requests.put(
         f"{EP['api']}{endpoint}",
         headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type":  "application/json",
+            "Authorization":  f"Bearer {token}",
+            "Content-Type":   "application/json",
+            "Content-Language": "en-US",
         },
         json=body,
         timeout=15,
     )
-    return response.json() if response.content else {"status": response.status_code}
+    try:
+        data = response.json() if response.content else {}
+    except Exception:
+        data = {"raw": response.text}
+    return data, response.status_code
 
-def get_my_listings() -> list:
-    """取得當前刊登列表"""
-    data = ebay_get("/sell/inventory/v1/inventory_item?limit=20")
-    return data.get("inventoryItems", [])
+def get_my_listings() -> tuple:
+    """取得當前刊登列表，回傳 (列表, 原始回應, status_code)"""
+    data, status = ebay_get("/sell/inventory/v1/inventory_item?limit=20")
+    items = data.get("inventoryItems", [])
+    return items, data, status
 
-def get_seller_summary() -> dict:
+def get_seller_summary() -> tuple:
     """取得賣家概況"""
     return ebay_get("/sell/account/v1/privilege")
 
-def create_inventory_item(sku: str, title: str, description: str, price: float, quantity: int) -> dict:
-    """建立/更新庫存品項"""
+def create_inventory_item(sku: str, title: str, description: str, price: float, quantity: int) -> tuple:
+    """建立/更新庫存品項（PUT 方法）"""
     body = {
         "availability": {
             "shipToLocationAvailability": {
@@ -233,9 +242,12 @@ def create_inventory_item(sku: str, title: str, description: str, price: float, 
         "product": {
             "title":       title,
             "description": description,
+            "aspects": {
+                "Brand": ["Unbranded"]
+            }
         }
     }
-    return ebay_post(f"/sell/inventory/v1/inventory_item/{sku}", body)
+    return ebay_put(f"/sell/inventory/v1/inventory_item/{sku}", body)
 
 # ─────────────────────────────────────────────
 # UI 頁面
@@ -328,7 +340,31 @@ def page_dashboard():
         st.markdown("### 我的 eBay 刊登")
         if st.button("🔄 刷新列表", type="secondary"):
             with st.spinner("讀取 eBay 資料中..."):
-                st.session_state.listings = get_my_listings()
+                items, raw, status = get_my_listings()
+                st.session_state.listings = items
+                st.session_state.listings_raw = raw
+                st.session_state.listings_status = status
+
+        # 顯示 API 回應狀態（debug）
+        if "listings_status" in st.session_state:
+            status = st.session_state.listings_status
+            raw    = st.session_state.get("listings_raw", {})
+
+            if status == 200 and st.session_state.listings:
+                st.success(f"✅ 成功讀取 {len(st.session_state.listings)} 件產品")
+            elif status == 200 and not st.session_state.listings:
+                st.warning("⚠️ API 連接成功，但 Sandbox 帳號內沒有刊登產品。請先到「新增產品」tab 建立一個測試產品。")
+            elif status == 204:
+                st.warning("⚠️ Sandbox 帳號目前沒有任何庫存產品（204 No Content）")
+            elif status == 403:
+                st.error("❌ 權限不足（403）— OAuth Scope 未包含 sell.inventory，需要重新授權")
+            elif status == 401:
+                st.error("❌ Token 已過期（401）— 請重新授權")
+            else:
+                st.error(f"❌ API 錯誤 {status}")
+
+            with st.expander("🔍 查看原始 API 回應（debug）"):
+                st.json(raw)
 
         if st.session_state.listings:
             for item in st.session_state.listings:
@@ -342,14 +378,15 @@ def page_dashboard():
                         st.write(f"**庫存:** {qty} 件")
                     st.write(f"**描述:** {item.get('product', {}).get('description', 'N/A')[:100]}...")
         else:
-            st.info("點擊「刷新列表」載入你的 eBay 刊登產品")
+            if "listings_status" not in st.session_state:
+                st.info("點擊「刷新列表」載入你的 eBay 刊登產品")
 
     with tab2:
         st.markdown("### 新增庫存品項")
         with st.container():
             col1, col2 = st.columns(2)
             with col1:
-                sku   = st.text_input("SKU（唯一識別碼）", placeholder="PRODUCT-001")
+                sku   = st.text_input("SKU（唯一識別碼）", placeholder="FORTUNE-RAMEN-001")
                 title = st.text_input("產品標題", placeholder="Japanese Ramen Bowl Set...")
                 price = st.number_input("售價 (USD)", min_value=0.01, value=9.99, step=0.01)
             with col2:
@@ -359,13 +396,16 @@ def page_dashboard():
             if st.button("📤 提交到 eBay 庫存", type="primary", use_container_width=True):
                 if sku and title and description:
                     with st.spinner("提交中..."):
-                        result = create_inventory_item(sku, title, description, price, quantity)
-                    if "error" not in str(result).lower():
-                        st.success(f"✅ 已成功建立 SKU: {sku}")
+                        result, status = create_inventory_item(sku, title, description, price, quantity)
+                    if status in [200, 201, 204]:
+                        st.success(f"✅ 已成功建立 SKU: {sku}（狀態碼 {status}）")
+                        st.info("現在去「刊登管理」tab 點「刷新列表」即可看到剛才建立的產品")
                     else:
-                        st.error(f"❌ 錯誤：{result}")
+                        st.error(f"❌ 錯誤（{status}）")
+                        with st.expander("查看錯誤詳情"):
+                            st.json(result)
                 else:
-                    st.warning("請填寫所有必填欄位")
+                    st.warning("請填寫 SKU、標題、描述三個必填欄位")
 
     with tab3:
         st.markdown("### 帳號設定")
