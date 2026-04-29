@@ -1,108 +1,160 @@
 """
-eBay SaaS - OAuth 授權 + 產品管理
+BeyBay - 多用戶 eBay SaaS 管理平台
 =====================================
-需要在 Streamlit Secrets 或 .env 設定：
-  EBAY_CLIENT_ID = "你的 eBay App Client ID"
-  EBAY_CLIENT_SECRET = "你的 eBay App Client Secret"
-  EBAY_REDIRECT_URI = "https://yourapp.streamlit.app/  (必須與 eBay Developer 填的一致)"
-  ENCRYPTION_KEY = "用 Fernet.generate_key() 生成的 base64 key"
+Streamlit Secrets 需要設定：
+  EBAY_CLIENT_ID     = "BarrySze-beybayap-SBX-f8f86d25c-ed0dc7f8"
+  EBAY_CLIENT_SECRET = "SBX-8f86d25ca516-15fb-40c2-9c63-2a2b"
+  EBAY_REDIRECT_URI  = "Barry_Sze-BarrySze-beybay-oacmlu"
+  ENCRYPTION_KEY     = "你的 Fernet Key"
+  SUPABASE_URL       = "https://eftrfbouonumjkmzatrv.supabase.co"
+  SUPABASE_ANON_KEY  = "eyJhbGc..."
+  SUPABASE_SERVICE_KEY = "eyJhbGc..."  ← service_role key
 
 安裝依賴：
-  pip install streamlit requests cryptography
+  pip install streamlit requests cryptography supabase
 """
 
 import streamlit as st
 import requests
-import json
 import base64
 import time
 from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
-from urllib.parse import urlencode, parse_qs, urlparse
-import os
+from urllib.parse import urlencode
+from supabase import create_client, Client
 
 # ─────────────────────────────────────────────
-# 設定區（從 Streamlit Secrets 讀取）
+# 設定
 # ─────────────────────────────────────────────
 def get_config():
-    """讀取設定，支援 st.secrets 和環境變數"""
-    try:
-        return {
-            "client_id":     st.secrets["EBAY_CLIENT_ID"],
-            "client_secret": st.secrets["EBAY_CLIENT_SECRET"],
-            "redirect_uri":  st.secrets["EBAY_REDIRECT_URI"],
-            "enc_key":       st.secrets["ENCRYPTION_KEY"],
-        }
-    except Exception:
-        # 本地開發 fallback（不要在生產環境用）
-        return {
-            "client_id":     os.getenv("EBAY_CLIENT_ID", "YOUR_CLIENT_ID"),
-            "client_secret": os.getenv("EBAY_CLIENT_SECRET", "YOUR_CLIENT_SECRET"),
-            "redirect_uri":  os.getenv("EBAY_REDIRECT_URI", "http://localhost:8501"),
-            "enc_key":       os.getenv("ENCRYPTION_KEY", Fernet.generate_key().decode()),
-        }
+    return {
+        "client_id":      st.secrets["EBAY_CLIENT_ID"],
+        "client_secret":  st.secrets["EBAY_CLIENT_SECRET"],
+        "redirect_uri":   st.secrets["EBAY_REDIRECT_URI"],
+        "enc_key":        st.secrets["ENCRYPTION_KEY"],
+        "supabase_url":   st.secrets["SUPABASE_URL"],
+        "supabase_anon":  st.secrets["SUPABASE_ANON_KEY"],
+        "supabase_svc":   st.secrets["SUPABASE_SERVICE_KEY"],
+    }
 
 CFG = get_config()
 
-# eBay API 端點（Production / Sandbox）
-EBAY_ENV = "sandbox"  # 改為 "production" 上線
-EBAY_ENDPOINTS = {
-    "sandbox": {
-        "auth":    "https://auth.sandbox.ebay.com/oauth2/authorize",
-        "token":   "https://api.sandbox.ebay.com/identity/v1/oauth2/token",
-        "api":     "https://api.sandbox.ebay.com",
-    },
-    "production": {
-        "auth":    "https://auth.ebay.com/oauth2/authorize",
-        "token":   "https://api.ebay.com/identity/v1/oauth2/token",
-        "api":     "https://api.ebay.com",
-    }
+# eBay Sandbox 端點
+EP = {
+    "auth":  "https://auth.sandbox.ebay.com/oauth2/authorize",
+    "token": "https://api.sandbox.ebay.com/identity/v1/oauth2/token",
+    "api":   "https://api.sandbox.ebay.com",
 }
-EP = EBAY_ENDPOINTS[EBAY_ENV]
 
-# eBay OAuth Scopes（按需求增減）
 SCOPES = " ".join([
     "https://api.ebay.com/oauth/api_scope",
     "https://api.ebay.com/oauth/api_scope/sell.inventory",
     "https://api.ebay.com/oauth/api_scope/sell.account",
-    "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
 ])
 
 # ─────────────────────────────────────────────
-# Token 加密工具
+# Supabase 客戶端
 # ─────────────────────────────────────────────
-def encrypt_token(token: str) -> str:
-    """加密 token（存入資料庫前使用）"""
-    f = Fernet(CFG["enc_key"].encode())
-    return f.encrypt(token.encode()).decode()
+@st.cache_resource
+def get_supabase() -> Client:
+    """一般用戶操作（受 RLS 保護）"""
+    return create_client(CFG["supabase_url"], CFG["supabase_anon"])
 
-def decrypt_token(encrypted: str) -> str:
-    """解密 token"""
-    f = Fernet(CFG["enc_key"].encode())
-    return f.decrypt(encrypted.encode()).decode()
+@st.cache_resource
+def get_supabase_admin() -> Client:
+    """管理員操作（繞過 RLS，存 Token 用）"""
+    return create_client(CFG["supabase_url"], CFG["supabase_svc"])
 
 # ─────────────────────────────────────────────
-# Session State 模擬資料庫（真實環境換 PostgreSQL）
+# 加密工具
+# ─────────────────────────────────────────────
+def encrypt(text: str) -> str:
+    return Fernet(CFG["enc_key"].encode()).encrypt(text.encode()).decode()
+
+def decrypt(encrypted: str) -> str:
+    return Fernet(CFG["enc_key"].encode()).decrypt(encrypted.encode()).decode()
+
+# ─────────────────────────────────────────────
+# Session 初始化
 # ─────────────────────────────────────────────
 def init_session():
     defaults = {
-        "authenticated": False,
+        "supabase_session": None,   # Supabase 登入 session
+        "user_id":          None,   # 當前用戶 UUID
+        "user_email":       None,   # 當前用戶電郵
+        "ebay_connected":   False,  # 是否已連接 eBay
         "access_token_enc": None,
-        "refresh_token_enc": None,
-        "token_expiry": None,
-        "ebay_user_id": None,
-        "listings": [],
-        "page": "home",
+        "refresh_token_enc":None,
+        "token_expiry":     None,
+        "listings":         [],
+        "listings_raw":     {},
+        "listings_status":  None,
+        "auth_page":        "login", # login / register
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 # ─────────────────────────────────────────────
-# eBay OAuth 流程
+# Supabase 用戶認證
+# ─────────────────────────────────────────────
+def sign_up(email: str, password: str) -> dict:
+    try:
+        res = get_supabase().auth.sign_up({"email": email, "password": password})
+        return {"success": True, "data": res}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def sign_in(email: str, password: str) -> dict:
+    try:
+        res = get_supabase().auth.sign_in_with_password({"email": email, "password": password})
+        return {"success": True, "session": res.session, "user": res.user}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def sign_out():
+    try:
+        get_supabase().auth.sign_out()
+    except Exception:
+        pass
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
+
+# ─────────────────────────────────────────────
+# eBay Token 存取（Supabase）
+# ─────────────────────────────────────────────
+def save_ebay_token(user_id: str, access_token: str, refresh_token: str, expiry: datetime):
+    """儲存加密 Token 到 Supabase"""
+    admin = get_supabase_admin()
+    # 先刪除舊的
+    admin.table("ebay_accounts").delete().eq("user_id", user_id).execute()
+    # 插入新的
+    admin.table("ebay_accounts").insert({
+        "user_id":        user_id,
+        "access_token":   encrypt(access_token),
+        "refresh_token":  encrypt(refresh_token),
+        "token_expiry":   expiry.isoformat(),
+        "ebay_client_id": CFG["client_id"],
+    }).execute()
+
+def load_ebay_token(user_id: str) -> dict | None:
+    """從 Supabase 讀取 Token"""
+    try:
+        admin = get_supabase_admin()
+        res = admin.table("ebay_accounts").select("*").eq("user_id", user_id).single().execute()
+        return res.data
+    except Exception:
+        return None
+
+def delete_ebay_token(user_id: str):
+    """撤銷 eBay 授權"""
+    get_supabase_admin().table("ebay_accounts").delete().eq("user_id", user_id).execute()
+
+# ─────────────────────────────────────────────
+# eBay OAuth
 # ─────────────────────────────────────────────
 def get_auth_url() -> str:
-    """生成 eBay 授權 URL"""
     params = {
         "client_id":     CFG["client_id"],
         "redirect_uri":  CFG["redirect_uri"],
@@ -112,13 +164,11 @@ def get_auth_url() -> str:
     }
     return f"{EP['auth']}?{urlencode(params)}"
 
-def exchange_code_for_token(code: str) -> dict:
-    """用授權碼換取 Access Token"""
+def exchange_code(code: str) -> dict:
     credentials = base64.b64encode(
         f"{CFG['client_id']}:{CFG['client_secret']}".encode()
     ).decode()
-
-    response = requests.post(
+    res = requests.post(
         EP["token"],
         headers={
             "Content-Type":  "application/x-www-form-urlencoded",
@@ -131,19 +181,13 @@ def exchange_code_for_token(code: str) -> dict:
         },
         timeout=15,
     )
-    return response.json()
+    return res.json()
 
-def refresh_access_token() -> bool:
-    """用 Refresh Token 自動換新 Access Token"""
-    if not st.session_state.refresh_token_enc:
-        return False
-
-    refresh_token = decrypt_token(st.session_state.refresh_token_enc)
+def refresh_token_fn(refresh_token: str) -> dict:
     credentials = base64.b64encode(
         f"{CFG['client_id']}:{CFG['client_secret']}".encode()
     ).decode()
-
-    response = requests.post(
+    res = requests.post(
         EP["token"],
         headers={
             "Content-Type":  "application/x-www-form-urlencoded",
@@ -155,311 +199,321 @@ def refresh_access_token() -> bool:
         },
         timeout=15,
     )
-
-    if response.status_code == 200:
-        data = response.json()
-        st.session_state.access_token_enc = encrypt_token(data["access_token"])
-        st.session_state.token_expiry = datetime.now() + timedelta(seconds=data["expires_in"] - 60)
-        return True
-    return False
+    return res.json()
 
 def get_valid_token() -> str | None:
-    """取得有效的 Access Token（自動刷新）"""
+    """取得有效 Token，自動刷新"""
     if not st.session_state.access_token_enc:
         return None
 
     # 檢查是否快到期
-    if st.session_state.token_expiry and datetime.now() >= st.session_state.token_expiry:
-        if not refresh_access_token():
-            st.session_state.authenticated = False
-            return None
+    if st.session_state.token_expiry:
+        expiry = datetime.fromisoformat(st.session_state.token_expiry) \
+            if isinstance(st.session_state.token_expiry, str) \
+            else st.session_state.token_expiry
 
-    return decrypt_token(st.session_state.access_token_enc)
+        if datetime.now() >= expiry:
+            # 自動刷新
+            refresh_tok = decrypt(st.session_state.refresh_token_enc)
+            result = refresh_token_fn(refresh_tok)
+            if "access_token" in result:
+                new_expiry = datetime.now() + timedelta(seconds=result["expires_in"] - 60)
+                st.session_state.access_token_enc = encrypt(result["access_token"])
+                st.session_state.token_expiry = new_expiry
+                # 同步更新 Supabase
+                save_ebay_token(
+                    st.session_state.user_id,
+                    result["access_token"],
+                    decrypt(st.session_state.refresh_token_enc),
+                    new_expiry,
+                )
+            else:
+                st.session_state.ebay_connected = False
+                return None
+
+    return decrypt(st.session_state.access_token_enc)
 
 # ─────────────────────────────────────────────
-# eBay API 調用
+# eBay API
 # ─────────────────────────────────────────────
 def ebay_get(endpoint: str) -> tuple:
-    """通用 GET 請求，回傳 (data, status_code)"""
     token = get_valid_token()
     if not token:
         return {"error": "未授權"}, 401
-
-    response = requests.get(
+    res = requests.get(
         f"{EP['api']}{endpoint}",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type":  "application/json",
-        },
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         timeout=15,
     )
     try:
-        return response.json(), response.status_code
+        return res.json(), res.status_code
     except Exception:
-        return {"raw": response.text}, response.status_code
+        return {"raw": res.text}, res.status_code
 
 def ebay_put(endpoint: str, body: dict) -> tuple:
-    """通用 PUT 請求（eBay Inventory API 用 PUT 建立/更新）"""
     token = get_valid_token()
     if not token:
         return {"error": "未授權"}, 401
-
-    response = requests.put(
+    res = requests.put(
         f"{EP['api']}{endpoint}",
         headers={
-            "Authorization":  f"Bearer {token}",
-            "Content-Type":   "application/json",
+            "Authorization":    f"Bearer {token}",
+            "Content-Type":     "application/json",
             "Content-Language": "en-US",
         },
         json=body,
         timeout=15,
     )
     try:
-        data = response.json() if response.content else {}
+        data = res.json() if res.content else {}
     except Exception:
-        data = {"raw": response.text}
-    return data, response.status_code
+        data = {"raw": res.text}
+    return data, res.status_code
 
 def get_my_listings() -> tuple:
-    """取得當前刊登列表，回傳 (列表, 原始回應, status_code)"""
     data, status = ebay_get("/sell/inventory/v1/inventory_item?limit=20")
-    items = data.get("inventoryItems", [])
-    return items, data, status
+    return data.get("inventoryItems", []), data, status
 
-def get_seller_summary() -> tuple:
-    """取得賣家概況"""
-    return ebay_get("/sell/account/v1/privilege")
-
-def create_inventory_item(sku: str, title: str, description: str, price: float, quantity: int) -> tuple:
-    """建立/更新庫存品項（PUT 方法）"""
+def create_inventory_item(sku, title, description, price, quantity) -> tuple:
     body = {
-        "availability": {
-            "shipToLocationAvailability": {
-                "quantity": quantity
-            }
-        },
+        "availability": {"shipToLocationAvailability": {"quantity": quantity}},
         "condition": "NEW",
         "product": {
-            "title":       title,
+            "title": title,
             "description": description,
-            "aspects": {
-                "Brand": ["Unbranded"]
-            }
-        }
+            "aspects": {"Brand": ["Unbranded"]},
+        },
     }
     return ebay_put(f"/sell/inventory/v1/inventory_item/{sku}", body)
 
 # ─────────────────────────────────────────────
-# UI 頁面
-# ─────────────────────────────────────────────
-def render_header():
-    st.markdown("""
-    <style>
-    .main-header {
-        background: linear-gradient(135deg, #0064D2 0%, #003087 100%);
-        padding: 1.5rem 2rem;
-        border-radius: 12px;
-        margin-bottom: 2rem;
-        display: flex;
-        align-items: center;
-        gap: 1rem;
-    }
-    .main-header h1 { color: white; margin: 0; font-size: 1.8rem; }
-    .main-header p  { color: #a8c8f0; margin: 0; font-size: 0.9rem; }
-    .token-badge {
-        background: #00a650;
-        color: white;
-        padding: 0.2rem 0.8rem;
-        border-radius: 20px;
-        font-size: 0.75rem;
-        font-weight: bold;
-    }
-    .stButton button {
-        border-radius: 8px;
-        font-weight: 600;
-    }
-    </style>
-    <div class="main-header">
-        <div>
-            <h1>🛒 eBay SaaS 管理平台</h1>
-            <p>連結你的 eBay 帳號，批量管理產品刊登</p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-def page_home():
-    """首頁 / 授權頁"""
-    render_header()
-
-    col1, col2 = st.columns([3, 2])
-    with col1:
-        st.markdown("## 🔑 連結你的 eBay 帳號")
-        st.markdown("""
-        授權後你可以：
-        - 📦 **查看所有刊登**產品
-        - ✏️ **批量更新**價格和庫存
-        - 📊 **監控**銷售數據
-        - 🔄 **自動同步**庫存
-        """)
-
-        auth_url = get_auth_url()
-        st.link_button("🔗 授權 eBay 帳號（官方安全頁面）", auth_url, type="primary", use_container_width=True)
-
-        st.info("⚠️ 你將跳轉到 eBay **官方頁面**授權，我們不會接觸你的密碼。", icon="🔒")
-
-    with col2:
-        st.markdown("### 授權流程")
-        st.markdown("""
-        ```
-        1. 點擊授權按鈕
-              ↓
-        2. eBay 官方登入頁
-              ↓
-        3. 同意授權範圍
-              ↓
-        4. 自動回到本平台
-              ↓
-        5. 開始管理產品 ✅
-        ```
-        """)
-
-def page_dashboard():
-    """主控制台"""
-    render_header()
-
-    # Token 狀態
-    expiry = st.session_state.token_expiry
-    if expiry:
-        remaining = (expiry - datetime.now()).seconds // 60
-        st.success(f"✅ 已授權 | Token 剩餘 {remaining} 分鐘（到期自動刷新）")
-
-    # 功能分頁
-    tab1, tab2, tab3 = st.tabs(["📦 刊登管理", "➕ 新增產品", "⚙️ 帳號設定"])
-
-    with tab1:
-        st.markdown("### 我的 eBay 刊登")
-        if st.button("🔄 刷新列表", type="secondary"):
-            with st.spinner("讀取 eBay 資料中..."):
-                items, raw, status = get_my_listings()
-                st.session_state.listings = items
-                st.session_state.listings_raw = raw
-                st.session_state.listings_status = status
-
-        # 顯示 API 回應狀態（debug）
-        if "listings_status" in st.session_state:
-            status = st.session_state.listings_status
-            raw    = st.session_state.get("listings_raw", {})
-
-            if status == 200 and st.session_state.listings:
-                st.success(f"✅ 成功讀取 {len(st.session_state.listings)} 件產品")
-            elif status == 200 and not st.session_state.listings:
-                st.warning("⚠️ API 連接成功，但 Sandbox 帳號內沒有刊登產品。請先到「新增產品」tab 建立一個測試產品。")
-            elif status == 204:
-                st.warning("⚠️ Sandbox 帳號目前沒有任何庫存產品（204 No Content）")
-            elif status == 403:
-                st.error("❌ 權限不足（403）— OAuth Scope 未包含 sell.inventory，需要重新授權")
-            elif status == 401:
-                st.error("❌ Token 已過期（401）— 請重新授權")
-            else:
-                st.error(f"❌ API 錯誤 {status}")
-
-            with st.expander("🔍 查看原始 API 回應（debug）"):
-                st.json(raw)
-
-        if st.session_state.listings:
-            for item in st.session_state.listings:
-                with st.expander(f"📦 {item.get('sku', 'N/A')} — {item.get('product', {}).get('title', '無標題')}"):
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.write(f"**SKU:** {item.get('sku')}")
-                        st.write(f"**狀態:** {item.get('condition', 'N/A')}")
-                    with col_b:
-                        qty = item.get("availability", {}).get("shipToLocationAvailability", {}).get("quantity", 0)
-                        st.write(f"**庫存:** {qty} 件")
-                    st.write(f"**描述:** {item.get('product', {}).get('description', 'N/A')[:100]}...")
-        else:
-            if "listings_status" not in st.session_state:
-                st.info("點擊「刷新列表」載入你的 eBay 刊登產品")
-
-    with tab2:
-        st.markdown("### 新增庫存品項")
-        with st.container():
-            col1, col2 = st.columns(2)
-            with col1:
-                sku   = st.text_input("SKU（唯一識別碼）", placeholder="FORTUNE-RAMEN-001")
-                title = st.text_input("產品標題", placeholder="Japanese Ramen Bowl Set...")
-                price = st.number_input("售價 (USD)", min_value=0.01, value=9.99, step=0.01)
-            with col2:
-                quantity    = st.number_input("庫存數量", min_value=1, value=10)
-                description = st.text_area("產品描述", placeholder="詳細描述你的產品...", height=120)
-
-            if st.button("📤 提交到 eBay 庫存", type="primary", use_container_width=True):
-                if sku and title and description:
-                    with st.spinner("提交中..."):
-                        result, status = create_inventory_item(sku, title, description, price, quantity)
-                    if status in [200, 201, 204]:
-                        st.success(f"✅ 已成功建立 SKU: {sku}（狀態碼 {status}）")
-                        st.info("現在去「刊登管理」tab 點「刷新列表」即可看到剛才建立的產品")
-                    else:
-                        st.error(f"❌ 錯誤（{status}）")
-                        with st.expander("查看錯誤詳情"):
-                            st.json(result)
-                else:
-                    st.warning("請填寫 SKU、標題、描述三個必填欄位")
-
-    with tab3:
-        st.markdown("### 帳號設定")
-        st.write(f"**eBay 環境:** {'🧪 Sandbox（測試）' if EBAY_ENV == 'sandbox' else '🟢 Production（正式）'}")
-        st.write(f"**授權時間:** {st.session_state.get('auth_time', 'N/A')}")
-
-        st.divider()
-        if st.button("🚪 撤銷授權 / 登出", type="secondary"):
-            for key in ["authenticated", "access_token_enc", "refresh_token_enc", "token_expiry", "listings"]:
-                st.session_state[key] = None if key != "authenticated" else False
-            st.session_state.listings = []
-            st.rerun()
-
-        st.markdown("---")
-        st.caption("💡 **關於安全性：** Token 以 AES-256 (Fernet) 加密存儲，不存儲你的 eBay 密碼。")
-
-# ─────────────────────────────────────────────
-# OAuth Callback 處理（關鍵！）
+# OAuth Callback 處理
 # ─────────────────────────────────────────────
 def handle_oauth_callback():
-    """
-    eBay 授權後會在 URL 帶回 ?code=xxx
-    Streamlit 從 query params 讀取
-    """
-    params = st.query_params
-    code = params.get("code")
-
-    if code and not st.session_state.authenticated:
-        with st.spinner("⏳ 正在向 eBay 換取授權 Token..."):
-            result = exchange_code_for_token(code)
+    code = st.query_params.get("code")
+    if code and st.session_state.user_id and not st.session_state.ebay_connected:
+        with st.spinner("⏳ 向 eBay 換取授權 Token..."):
+            result = exchange_code(code)
 
         if "access_token" in result:
-            # 加密存儲 Token
-            st.session_state.access_token_enc  = encrypt_token(result["access_token"])
-            st.session_state.refresh_token_enc = encrypt_token(result.get("refresh_token", ""))
-            st.session_state.token_expiry      = datetime.now() + timedelta(seconds=result.get("expires_in", 7200) - 60)
-            st.session_state.authenticated     = True
-            st.session_state.auth_time         = datetime.now().strftime("%Y-%m-%d %H:%M")
+            expiry = datetime.now() + timedelta(seconds=result.get("expires_in", 7200) - 60)
 
-            # 清除 URL 的 code 參數（安全）
+            # 存入 session
+            st.session_state.access_token_enc  = encrypt(result["access_token"])
+            st.session_state.refresh_token_enc = encrypt(result.get("refresh_token", ""))
+            st.session_state.token_expiry      = expiry
+            st.session_state.ebay_connected    = True
+
+            # 存入 Supabase
+            save_ebay_token(
+                st.session_state.user_id,
+                result["access_token"],
+                result.get("refresh_token", ""),
+                expiry,
+            )
+
             st.query_params.clear()
             st.success("🎉 eBay 帳號授權成功！")
             time.sleep(1)
             st.rerun()
         else:
             st.error(f"授權失敗：{result.get('error_description', '未知錯誤')}")
-            st.code(json.dumps(result, indent=2))
+            st.query_params.clear()
+
+# ─────────────────────────────────────────────
+# UI：登入 / 註冊頁
+# ─────────────────────────────────────────────
+def page_auth():
+    st.markdown("""
+    <div style="max-width:420px;margin:4rem auto;text-align:center">
+        <h1 style="font-size:2.5rem">🛒 BeyBay</h1>
+        <p style="color:#666">eBay 多帳號管理平台</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        tab_login, tab_register = st.tabs(["登入", "註冊"])
+
+        with tab_login:
+            email    = st.text_input("電郵", key="login_email", placeholder="you@example.com")
+            password = st.text_input("密碼", key="login_password", type="password")
+
+            if st.button("登入", type="primary", use_container_width=True):
+                if email and password:
+                    with st.spinner("登入中..."):
+                        result = sign_in(email, password)
+                    if result["success"]:
+                        user = result["user"]
+                        session = result["session"]
+                        st.session_state.user_id    = user.id
+                        st.session_state.user_email = user.email
+                        st.session_state.supabase_session = session
+
+                        # 從 Supabase 載入已有的 eBay Token
+                        token_data = load_ebay_token(user.id)
+                        if token_data:
+                            st.session_state.access_token_enc  = token_data["access_token"]
+                            st.session_state.refresh_token_enc = token_data["refresh_token"]
+                            st.session_state.token_expiry      = token_data["token_expiry"]
+                            st.session_state.ebay_connected    = True
+
+                        st.rerun()
+                    else:
+                        st.error(f"登入失敗：{result['error']}")
+                else:
+                    st.warning("請填寫電郵和密碼")
+
+        with tab_register:
+            reg_email    = st.text_input("電郵", key="reg_email", placeholder="you@example.com")
+            reg_password = st.text_input("密碼（最少6位）", key="reg_password", type="password")
+            reg_confirm  = st.text_input("確認密碼", key="reg_confirm", type="password")
+
+            if st.button("建立帳號", type="primary", use_container_width=True):
+                if reg_email and reg_password and reg_confirm:
+                    if reg_password != reg_confirm:
+                        st.error("兩次密碼不一致")
+                    elif len(reg_password) < 6:
+                        st.error("密碼至少需要 6 個字元")
+                    else:
+                        with st.spinner("建立帳號中..."):
+                            result = sign_up(reg_email, reg_password)
+                        if result["success"]:
+                            st.success("✅ 帳號建立成功！請檢查電郵確認後登入。")
+                        else:
+                            st.error(f"註冊失敗：{result['error']}")
+                else:
+                    st.warning("請填寫所有欄位")
+
+# ─────────────────────────────────────────────
+# UI：主控制台
+# ─────────────────────────────────────────────
+def page_dashboard():
+    # Header
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#0064D2,#003087);padding:1.5rem 2rem;
+                border-radius:12px;margin-bottom:1.5rem;display:flex;
+                justify-content:space-between;align-items:center">
+        <div>
+            <h1 style="color:white;margin:0;font-size:1.8rem">🛒 BeyBay</h1>
+            <p style="color:#a8c8f0;margin:0;font-size:0.9rem">eBay 多帳號管理平台</p>
+        </div>
+        <div style="color:#a8c8f0;font-size:0.85rem">👤 {st.session_state.user_email}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # eBay 連接狀態
+    if st.session_state.ebay_connected:
+        expiry = st.session_state.token_expiry
+        if expiry:
+            if isinstance(expiry, str):
+                expiry = datetime.fromisoformat(expiry)
+            remaining = max(0, int((expiry - datetime.now()).total_seconds() // 60))
+            st.success(f"✅ eBay 已授權 | Token 剩餘 {remaining} 分鐘（到期自動刷新）")
+    else:
+        st.warning("⚠️ 尚未連接 eBay 帳號")
+        st.link_button("🔗 授權 eBay 帳號", get_auth_url(), type="primary")
+        st.info("點擊後會跳到 eBay 官方頁面授權，我們不會接觸你的 eBay 密碼。", icon="🔒")
+        st.divider()
+
+    if not st.session_state.ebay_connected:
+        st.stop()
+
+    # 功能分頁
+    tab1, tab2, tab3 = st.tabs(["📦 刊登管理", "➕ 新增產品", "⚙️ 設定"])
+
+    with tab1:
+        st.markdown("### 我的 eBay 刊登")
+        if st.button("🔄 刷新列表", type="secondary"):
+            with st.spinner("讀取 eBay 資料中..."):
+                items, raw, status = get_my_listings()
+                st.session_state.listings        = items
+                st.session_state.listings_raw    = raw
+                st.session_state.listings_status = status
+
+        if st.session_state.listings_status is not None:
+            status = st.session_state.listings_status
+            if status == 200 and st.session_state.listings:
+                st.success(f"✅ 成功讀取 {len(st.session_state.listings)} 件產品")
+            elif status in [200, 204] and not st.session_state.listings:
+                st.warning("⚠️ Sandbox 帳號沒有刊登產品，請先到「新增產品」tab 建立測試產品。")
+            elif status == 403:
+                st.error("❌ 權限不足（403）— 請重新授權")
+            else:
+                st.error(f"❌ API 錯誤 {status}")
+
+            with st.expander("🔍 原始 API 回應（debug）"):
+                st.json(st.session_state.listings_raw)
+
+        for item in st.session_state.listings:
+            with st.expander(f"📦 {item.get('sku')} — {item.get('product', {}).get('title', '無標題')}"):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.write(f"**SKU:** {item.get('sku')}")
+                    st.write(f"**狀態:** {item.get('condition', 'N/A')}")
+                with col_b:
+                    qty = item.get("availability", {}).get("shipToLocationAvailability", {}).get("quantity", 0)
+                    st.write(f"**庫存:** {qty} 件")
+                desc = item.get("product", {}).get("description", "")
+                if desc:
+                    st.write(f"**描述:** {desc[:120]}...")
+
+    with tab2:
+        st.markdown("### 新增庫存品項")
+        col1, col2 = st.columns(2)
+        with col1:
+            sku         = st.text_input("SKU（唯一識別碼）", placeholder="FORTUNE-RAMEN-001")
+            title       = st.text_input("產品標題", placeholder="Japanese Ramen Bowl Set")
+            price       = st.number_input("售價 (USD)", min_value=0.01, value=9.99, step=0.01)
+        with col2:
+            quantity    = st.number_input("庫存數量", min_value=1, value=10)
+            description = st.text_area("產品描述", placeholder="詳細描述你的產品...", height=130)
+
+        if st.button("📤 提交到 eBay 庫存", type="primary", use_container_width=True):
+            if sku and title and description:
+                with st.spinner("提交中..."):
+                    result, status = create_inventory_item(sku, title, description, price, quantity)
+                if status in [200, 201, 204]:
+                    st.success(f"✅ 成功建立 SKU: {sku}（{status}）")
+                    st.info("去「刊登管理」tab 點「刷新列表」查看")
+                else:
+                    st.error(f"❌ 錯誤（{status}）")
+                    with st.expander("錯誤詳情"):
+                        st.json(result)
+            else:
+                st.warning("請填寫 SKU、標題、描述")
+
+    with tab3:
+        st.markdown("### 帳號設定")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**BeyBay 帳號**")
+            st.write(f"電郵：{st.session_state.user_email}")
+            if st.button("🚪 登出 BeyBay", use_container_width=True):
+                sign_out()
+
+        with col_b:
+            st.markdown("**eBay 授權**")
+            st.write("環境：🧪 Sandbox（測試）")
+            if st.button("❌ 撤銷 eBay 授權", use_container_width=True, type="secondary"):
+                delete_ebay_token(st.session_state.user_id)
+                st.session_state.ebay_connected    = False
+                st.session_state.access_token_enc  = None
+                st.session_state.refresh_token_enc = None
+                st.session_state.token_expiry      = None
+                st.session_state.listings          = []
+                st.rerun()
+
+        st.divider()
+        st.caption("🔒 所有 eBay Token 以 AES-256 加密存儲於 Supabase，不存儲 eBay 密碼。")
 
 # ─────────────────────────────────────────────
 # 主程式
 # ─────────────────────────────────────────────
 def main():
     st.set_page_config(
-        page_title="eBay SaaS 管理平台",
+        page_title="BeyBay - eBay 管理平台",
         page_icon="🛒",
         layout="wide",
         initial_sidebar_state="collapsed",
@@ -467,14 +521,14 @@ def main():
 
     init_session()
 
-    # 優先處理 OAuth callback
+    # OAuth callback 優先處理
     handle_oauth_callback()
 
     # 路由
-    if st.session_state.authenticated:
+    if st.session_state.user_id:
         page_dashboard()
     else:
-        page_home()
+        page_auth()
 
 if __name__ == "__main__":
     main()
