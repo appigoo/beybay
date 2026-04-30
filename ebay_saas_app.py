@@ -42,7 +42,7 @@ CFG = get_config()
 # ─────────────────────────────────────────────
 # 環境切換 ← 改這一行切換 sandbox/production
 # ─────────────────────────────────────────────
-EBAY_ENV = "production"  # 改為 "production" 切換正式環境
+EBAY_ENV = "sandbox"  # 改為 "production" 切換正式環境
 
 EBAY_ENDPOINTS = {
     "sandbox": {
@@ -62,6 +62,7 @@ SCOPES = " ".join([
     "https://api.ebay.com/oauth/api_scope",
     "https://api.ebay.com/oauth/api_scope/sell.inventory",
     "https://api.ebay.com/oauth/api_scope/sell.account",
+    "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
 ])
 
 # ─────────────────────────────────────────────
@@ -283,8 +284,97 @@ def ebay_put(endpoint: str, body: dict) -> tuple:
     return data, res.status_code
 
 def get_my_listings() -> tuple:
-    data, status = ebay_get("/sell/inventory/v1/inventory_item?limit=20")
-    return data.get("inventoryItems", []), data, status
+    """
+    讀取真實刊登 — 用 Trading API（GetMyeBaySelling）
+    這是大部分 eBay 賣家使用的舊系統，能讀到網站直接刊登的產品
+    """
+    token = get_valid_token()
+    if not token:
+        return [], {"error": "未授權"}, 401
+
+    # Trading API 用 XML + POST
+    trading_url = "https://api.ebay.com/ws/api.dll" \
+        if EBAY_ENV == "production" \
+        else "https://api.sandbox.ebay.com/ws/api.dll"
+
+    xml_body = """<?xml version="1.0" encoding="utf-8"?>
+<GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>{token}</eBayAuthToken>
+  </RequesterCredentials>
+  <ActiveList>
+    <Include>true</Include>
+    <Pagination>
+      <EntriesPerPage>50</EntriesPerPage>
+      <PageNumber>1</PageNumber>
+    </Pagination>
+  </ActiveList>
+  <SoldList>
+    <Include>true</Include>
+    <Pagination>
+      <EntriesPerPage>10</EntriesPerPage>
+    </Pagination>
+  </SoldList>
+  <ErrorLanguage>en_US</ErrorLanguage>
+  <WarningLevel>High</WarningLevel>
+</GetMyeBaySellingRequest>""".format(token=token)
+
+    try:
+        res = requests.post(
+            trading_url,
+            headers={
+                "X-EBAY-API-SITEID":        "3",  # 3 = UK
+                "X-EBAY-API-COMPATIBILITY-LEVEL": "967",
+                "X-EBAY-API-CALL-NAME":     "GetMyeBaySelling",
+                "X-EBAY-API-APP-NAME":      CFG["client_id"],
+                "Content-Type":             "text/xml",
+            },
+            data=xml_body.encode("utf-8"),
+            timeout=20,
+        )
+
+        # 解析 XML 回應
+        import xml.etree.ElementTree as ET
+        ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
+        root = ET.fromstring(res.text)
+
+        # 檢查是否成功
+        ack = root.findtext("e:Ack", namespaces=ns)
+        if ack not in ["Success", "Warning"]:
+            errors = root.findall(".//e:Errors", namespaces=ns)
+            error_msgs = [e.findtext("e:ShortMessage", namespaces=ns) for e in errors]
+            return [], {"ack": ack, "errors": error_msgs, "raw": res.text[:500]}, 400
+
+        # 提取 Active 刊登
+        items = []
+        active_list = root.find(".//e:ActiveList/e:ItemArray", namespaces=ns)
+        if active_list:
+            for item in active_list.findall("e:Item", namespaces=ns):
+                items.append({
+                    "item_id":       item.findtext("e:ItemID", namespaces=ns),
+                    "title":         item.findtext("e:Title", namespaces=ns),
+                    "price":         item.findtext("e:BuyItNowPrice", namespaces=ns)
+                                     or item.findtext(".//e:StartPrice", namespaces=ns),
+                    "currency":      "GBP",
+                    "quantity":      item.findtext("e:QuantityAvailable", namespaces=ns, default="0"),
+                    "watch_count":   item.findtext("e:WatchCount", namespaces=ns, default="0"),
+                    "view_count":    item.findtext("e:HitCount", namespaces=ns, default="0"),
+                    "time_left":     item.findtext("e:TimeLeft", namespaces=ns),
+                    "listing_url":   item.findtext("e:ListingDetails/e:ViewItemURL", namespaces=ns),
+                    "gallery_url":   item.findtext("e:PictureDetails/e:GalleryURL", namespaces=ns),
+                    "condition":     item.findtext(".//e:ConditionDisplayName", namespaces=ns),
+                    "source":        "trading_api",
+                })
+
+        raw_summary = {
+            "ack":          ack,
+            "total_active": root.findtext(".//e:ActiveList/e:PaginationResult/e:TotalNumberOfEntries", namespaces=ns),
+            "total_sold":   root.findtext(".//e:SoldList/e:PaginationResult/e:TotalNumberOfEntries", namespaces=ns),
+        }
+        return items, raw_summary, 200
+
+    except Exception as ex:
+        return [], {"error": str(ex)}, 500
 
 def create_inventory_item(sku, title, description, price, quantity) -> tuple:
     body = {
@@ -445,30 +535,58 @@ def page_dashboard():
 
         if st.session_state.listings_status is not None:
             status = st.session_state.listings_status
+            raw    = st.session_state.listings_raw
             if status == 200 and st.session_state.listings:
-                st.success(f"✅ 成功讀取 {len(st.session_state.listings)} 件產品")
-            elif status in [200, 204] and not st.session_state.listings:
-                st.warning("⚠️ Sandbox 帳號沒有刊登產品，請先到「新增產品」tab 建立測試產品。")
+                total = raw.get("total_active", len(st.session_state.listings))
+                st.success(f"✅ 成功讀取 {total} 件 Active 刊登")
+            elif status == 200 and not st.session_state.listings:
+                st.warning("⚠️ 此 eBay 帳號目前沒有 Active 刊登產品。")
             elif status == 403:
                 st.error("❌ 權限不足（403）— 請重新授權")
+            elif status == 400:
+                errs = raw.get("errors", [])
+                st.error(f"❌ API 錯誤：{', '.join([e for e in errs if e])}")
             else:
-                st.error(f"❌ API 錯誤 {status}")
+                st.error(f"❌ 錯誤 {status}")
 
             with st.expander("🔍 原始 API 回應（debug）"):
-                st.json(st.session_state.listings_raw)
+                st.json(raw)
 
         for item in st.session_state.listings:
-            with st.expander(f"📦 {item.get('sku')} — {item.get('product', {}).get('title', '無標題')}"):
-                col_a, col_b = st.columns(2)
+            title     = item.get("title", "無標題")
+            item_id   = item.get("item_id", "")
+            price     = item.get("price", "N/A")
+            qty       = item.get("quantity", "0")
+            watches   = item.get("watch_count", "0")
+            views     = item.get("view_count", "0")
+            time_left = item.get("time_left", "")
+            url       = item.get("listing_url", "")
+            img       = item.get("gallery_url", "")
+            condition = item.get("condition", "N/A")
+
+            # 格式化剩餘時間
+            def fmt_time(t):
+                if not t:
+                    return "N/A"
+                t = t.replace("P", "").replace("T", " ").replace("D", "天 ").replace("H", "時 ").replace("M", "分").replace("S", "")
+                return t.strip()
+
+            with st.expander(f"📦 {title[:60]}"):
+                col_a, col_b = st.columns([2, 1])
                 with col_a:
-                    st.write(f"**SKU:** {item.get('sku')}")
-                    st.write(f"**狀態:** {item.get('condition', 'N/A')}")
+                    if img:
+                        st.image(img, width=120)
+                    st.write(f"**標題：** {title}")
+                    st.write(f"**Item ID：** {item_id}")
+                    st.write(f"**狀態：** {condition}")
+                    if url:
+                        st.markdown(f"[🔗 在 eBay 查看]({url})")
                 with col_b:
-                    qty = item.get("availability", {}).get("shipToLocationAvailability", {}).get("quantity", 0)
-                    st.write(f"**庫存:** {qty} 件")
-                desc = item.get("product", {}).get("description", "")
-                if desc:
-                    st.write(f"**描述:** {desc[:120]}...")
+                    st.metric("售價", f"£{price}")
+                    st.metric("庫存", f"{qty} 件")
+                    st.metric("關注者", f"{watches} 人")
+                    st.metric("瀏覽", f"{views} 次")
+                    st.write(f"⏱ 剩餘：{fmt_time(time_left)}")
 
     with tab2:
         st.markdown("### 新增庫存品項")
