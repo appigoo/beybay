@@ -521,8 +521,11 @@ def page_dashboard():
     if not st.session_state.ebay_connected:
         st.stop()
 
+    # 注入 supabase admin 供 repricer 使用
+    st.session_state._supabase_admin = get_supabase_admin()
+
     # 功能分頁
-    tab1, tab2, tab3 = st.tabs(["📦 刊登管理", "➕ 新增產品", "⚙️ 設定"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📦 刊登管理", "🏷️ 自動調價", "➕ 新增產品", "⚙️ 設定"])
 
     with tab1:
         st.markdown("### 我的 eBay 刊登")
@@ -589,6 +592,15 @@ def page_dashboard():
                     st.write(f"⏱ 剩餘：{fmt_time(time_left)}")
 
     with tab2:
+        from repricer_module import render_repricer_tab
+        render_repricer_tab(
+            user_id=st.session_state.user_id,
+            listings=st.session_state.listings,
+            get_token_fn=get_valid_token,
+            ep=EP,
+        )
+
+    with tab3:
         st.markdown("### 新增庫存品項")
         col1, col2 = st.columns(2)
         with col1:
@@ -613,7 +625,7 @@ def page_dashboard():
             else:
                 st.warning("請填寫 SKU、標題、描述")
 
-    with tab3:
+    with tab4:
         st.markdown("### 帳號設定")
 
         col_a, col_b = st.columns(2)
