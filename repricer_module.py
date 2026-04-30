@@ -3,23 +3,25 @@ BeyBay 自動調價模組
 ====================
 先在 Supabase SQL Editor 執行以下 SQL：
 
+-- 如果是全新安裝，執行這個：
 CREATE TABLE repricer_settings (
-  id              bigint generated always as identity primary key,
-  user_id         uuid references auth.users(id) on delete cascade,
-  item_id         text not null,
-  item_title      text,
-  min_price       numeric(10,2) not null,
-  max_price       numeric(10,2) not null,
-  strategy        text default 'second_lowest',
-  -- 策略選項：lowest / second_lowest / top3
-  auto_execute    boolean default false,
-  notify_telegram boolean default false,
-  telegram_token  text,
-  telegram_chat_id text,
-  is_active       boolean default true,
-  last_checked    timestamptz,
-  last_action     text,
-  created_at      timestamptz default now()
+  id                  bigint generated always as identity primary key,
+  user_id             uuid references auth.users(id) on delete cascade,
+  item_id             text not null,
+  item_title          text,
+  min_price           numeric(10,2) not null,
+  max_price           numeric(10,2) not null,
+  strategy            text default 'second_lowest',
+  search_keywords     text default '',
+  scan_interval_mins  int default 0,
+  auto_execute        boolean default false,
+  notify_telegram     boolean default false,
+  telegram_token      text,
+  telegram_chat_id    text,
+  is_active           boolean default true,
+  last_checked        timestamptz,
+  last_action         text,
+  created_at          timestamptz default now()
 );
 
 alter table repricer_settings enable row level security;
@@ -28,18 +30,21 @@ create policy "insert_own" on repricer_settings for insert with check (auth.uid(
 create policy "update_own" on repricer_settings for update using (auth.uid() = user_id);
 create policy "delete_own" on repricer_settings for delete using (auth.uid() = user_id);
 
+-- 如果已有舊版 repricer_settings，只執行這兩行新增欄位：
+-- ALTER TABLE repricer_settings ADD COLUMN IF NOT EXISTS search_keywords text default '';
+-- ALTER TABLE repricer_settings ADD COLUMN IF NOT EXISTS scan_interval_mins int default 0;
+
 CREATE TABLE repricer_log (
-  id           bigint generated always as identity primary key,
-  user_id      uuid references auth.users(id) on delete cascade,
-  item_id      text,
-  item_title   text,
-  old_price    numeric(10,2),
-  new_price    numeric(10,2),
-  competitor_price numeric(10,2),
-  action       text,
-  -- 'adjusted' / 'skipped_min_price' / 'already_competitive' / 'pending_approval'
-  executed     boolean default false,
-  created_at   timestamptz default now()
+  id                  bigint generated always as identity primary key,
+  user_id             uuid references auth.users(id) on delete cascade,
+  item_id             text,
+  item_title          text,
+  old_price           numeric(10,2),
+  new_price           numeric(10,2),
+  competitor_price    numeric(10,2),
+  action              text,
+  executed            boolean default false,
+  created_at          timestamptz default now()
 );
 
 alter table repricer_log enable row level security;
@@ -330,8 +335,9 @@ def run_repricer_scan(user_id: str, listings: list, get_token_fn, ep: dict) -> l
         your_price = float(item.get("price") or 0)
         title      = item.get("title", "")
 
-        # 搜尋競爭對手
-        competitors = get_competitor_prices(title, item_id, token, ep)
+        # 搜尋競爭對手（優先用自定義關鍵字）
+        keywords = s.get("search_keywords", "").strip() or title[:40]
+        competitors = get_competitor_prices(keywords, item_id, token, ep)
 
         # 計算目標價格
         target, ref_price, action = calculate_target_price(
@@ -343,18 +349,19 @@ def run_repricer_scan(user_id: str, listings: list, get_token_fn, ep: dict) -> l
         )
 
         result = {
-            "item_id":        item_id,
-            "title":          title,
-            "your_price":     your_price,
-            "target_price":   target,
-            "ref_price":      ref_price,
-            "action":         action,
-            "competitors":    competitors[:5],
-            "auto_execute":   s["auto_execute"],
-            "notify_telegram":s["notify_telegram"],
-            "telegram_token": s.get("telegram_token", ""),
+            "item_id":          item_id,
+            "title":            title,
+            "search_keywords":  keywords,
+            "your_price":       your_price,
+            "target_price":     target,
+            "ref_price":        ref_price,
+            "action":           action,
+            "competitors":      competitors[:5],
+            "auto_execute":     s["auto_execute"],
+            "notify_telegram":  s["notify_telegram"],
+            "telegram_token":   s.get("telegram_token", ""),
             "telegram_chat_id": s.get("telegram_chat_id", ""),
-            "setting":        s,
+            "setting":          s,
         }
 
         # 自動執行
@@ -476,6 +483,38 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
                 }[x],
             )
 
+            # 🆕 自定義搜尋關鍵字
+            st.markdown("**搜尋關鍵字**")
+            default_keywords = existing.get("search_keywords", "") or \
+                               selected_item.get("title", "")[:40]
+            search_keywords = st.text_input(
+                "自定義競爭對手搜尋詞",
+                value=default_keywords,
+                placeholder="例如：Tomica Limited 0156",
+                help="留空則自動用產品標題前40字搜尋。建議填入核心型號，搜尋更精準。",
+            )
+
+            # 🆕 自動掃描間隔
+            st.markdown("**自動掃描**")
+            scan_interval = st.selectbox(
+                "自動掃描間隔",
+                [0, 15, 30, 60, 120, 240],
+                index=[0, 15, 30, 60, 120, 240].index(
+                    int(existing.get("scan_interval_mins", 0))
+                ),
+                format_func=lambda x: {
+                    0:   "❌ 關閉（只手動掃描）",
+                    15:  "每 15 分鐘",
+                    30:  "每 30 分鐘",
+                    60:  "每 1 小時",
+                    120: "每 2 小時",
+                    240: "每 4 小時",
+                }[x],
+                help="需要保持 app 頁面開啟才能自動掃描",
+            )
+            if scan_interval > 0:
+                st.caption(f"⚠️ 需保持此頁面開啟，系統每 {scan_interval} 分鐘自動掃描一次")
+
         with col2:
             st.markdown("**執行設定**")
             auto_execute = st.toggle(
@@ -514,16 +553,18 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
                     st.error("最低售價必須低於最高售價")
                 else:
                     ok = save_repricer_setting(user_id, {
-                        "item_id":          item_id,
-                        "item_title":       selected_item.get("title", ""),
-                        "min_price":        min_price,
-                        "max_price":        max_price,
-                        "strategy":         strategy,
-                        "auto_execute":     auto_execute,
-                        "notify_telegram":  notify_telegram,
-                        "telegram_token":   telegram_token,
-                        "telegram_chat_id": telegram_chat_id,
-                        "is_active":        is_active,
+                        "item_id":            item_id,
+                        "item_title":         selected_item.get("title", ""),
+                        "min_price":          min_price,
+                        "max_price":          max_price,
+                        "strategy":           strategy,
+                        "search_keywords":    search_keywords.strip(),
+                        "scan_interval_mins": scan_interval,
+                        "auto_execute":       auto_execute,
+                        "notify_telegram":    notify_telegram,
+                        "telegram_token":     telegram_token,
+                        "telegram_chat_id":   telegram_chat_id,
+                        "is_active":          is_active,
                     })
                     if ok:
                         st.success(f"✅ 規則已儲存：{selected_item.get('title', '')[:40]}")
@@ -541,13 +582,16 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
             st.divider()
             st.markdown(f"#### 已設定規則（{len(settings)} 條）")
             for s in settings:
-                status = "✅ 啟用" if s["is_active"] else "⏸ 暫停"
-                auto   = "🤖 全自動" if s["auto_execute"] else "👁 人工確認"
-                tg     = "📱 Telegram" if s["notify_telegram"] else ""
+                status   = "✅ 啟用" if s["is_active"] else "⏸ 暫停"
+                auto     = "🤖 全自動" if s["auto_execute"] else "👁 人工確認"
+                tg       = "📱 Telegram" if s["notify_telegram"] else ""
+                interval = s.get("scan_interval_mins", 0)
+                timer    = f"⏱ 每{interval}分鐘" if interval else "🖐 手動"
+                keywords = s.get("search_keywords", "")
                 strategy_label = {
-                    "lowest": "跟最低價",
+                    "lowest":        "跟最低價",
                     "second_lowest": "跟第二低價",
-                    "top3": "跟前三平均",
+                    "top3":          "跟前三平均",
                 }.get(s["strategy"], s["strategy"])
 
                 with st.expander(f"{status} {s.get('item_title', s['item_id'])[:45]}"):
@@ -555,7 +599,9 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
                     c1.metric("最低售價", f"£{s['min_price']:.2f}")
                     c2.metric("最高售價", f"£{s['max_price']:.2f}")
                     c3.metric("策略", strategy_label)
-                    st.caption(f"{auto} {tg}")
+                    st.caption(f"{auto} {tg} {timer}")
+                    if keywords:
+                        st.caption(f"🔍 搜尋詞：{keywords}")
 
     # ════════════════════════════════
     # 子頁二：立即掃描
@@ -572,12 +618,55 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
             st.info("請先到「刊登管理」tab 刷新列表。")
             return
 
-        st.markdown(f"**{len(active)} 條規則待掃描**")
+        # 自動掃描狀態
+        intervals = [s.get("scan_interval_mins", 0) for s in active if s.get("scan_interval_mins", 0) > 0]
+        min_interval = min(intervals) if intervals else 0
 
-        if st.button("🔍 立即掃描競爭對手價格", type="primary", use_container_width=True):
+        col_info, col_btn = st.columns([3, 1])
+        with col_info:
+            st.markdown(f"**{len(active)} 條規則待掃描**")
+            if min_interval:
+                st.caption(f"⏱ 自動掃描已開啟：每 {min_interval} 分鐘掃描一次（需保持頁面開啟）")
+            else:
+                st.caption("🖐 手動模式：點按鈕掃描")
+
+        with col_btn:
+            manual_scan = st.button("🔍 立即掃描", type="primary", use_container_width=True)
+
+        # 自動定時掃描
+        if min_interval > 0:
+            import time as _time
+            now = _time.time()
+            last_scan = st.session_state.get("last_auto_scan", 0)
+            next_scan_in = max(0, int(min_interval * 60 - (now - last_scan)))
+
+            if next_scan_in > 0:
+                st.info(f"⏳ 下次自動掃描：{next_scan_in // 60} 分 {next_scan_in % 60} 秒後")
+            
+            # 到時間了自動掃描
+            auto_trigger = (now - last_scan) >= min_interval * 60
+
+            if auto_trigger and not manual_scan:
+                st.session_state.last_auto_scan = now
+                with st.spinner("⏱ 自動掃描中..."):
+                    results = run_repricer_scan(user_id, listings, get_token_fn, ep)
+                st.session_state.repricer_results = results
+                st.rerun()
+
+            # 頁面自動刷新（每30秒更新倒計時）
+            st.markdown(f"""
+            <script>
+            setTimeout(function() {{ window.location.reload(); }}, 30000);
+            </script>
+            """, unsafe_allow_html=True)
+
+        if manual_scan:
             with st.spinner("掃描中，正在搜尋競爭對手價格..."):
                 results = run_repricer_scan(user_id, listings, get_token_fn, ep)
             st.session_state.repricer_results = results
+            if min_interval:
+                import time as _time
+                st.session_state.last_auto_scan = _time.time()
 
         # 顯示掃描結果
         results = st.session_state.get("repricer_results", [])
@@ -590,18 +679,21 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
                 ref        = r["ref_price"]
                 title      = r["title"]
                 executed   = r.get("executed", False)
+                keywords   = r.get("search_keywords", "")
 
-                # 狀態顏色
                 if "adjusted" in action and not executed:
-                    icon = "🟡"  # 待確認
+                    icon = "🟡"
                 elif executed:
-                    icon = "🟢"  # 已執行
+                    icon = "🟢"
                 elif "skipped" in action:
-                    icon = "🔴"  # 低於底線
+                    icon = "🔴"
                 else:
-                    icon = "⚪"  # 無需調整
+                    icon = "⚪"
 
                 with st.expander(f"{icon} {title[:55]}"):
+                    if keywords:
+                        st.caption(f"🔍 搜尋詞：{keywords}")
+
                     col_a, col_b, col_c = st.columns(3)
                     col_a.metric("你的現價", f"£{your_price:.2f}")
                     col_b.metric("競爭對手", f"£{ref:.2f}" if ref else "N/A")
@@ -613,13 +705,11 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
 
                     st.caption(f"動作：{action}")
 
-                    # 競爭對手列表
                     if r["competitors"]:
                         st.markdown("**競爭對手（最低5個）：**")
                         for i, c in enumerate(r["competitors"], 1):
                             st.write(f"{i}. £{c['price']:.2f} — {c['title'][:40]}")
 
-                    # 人工確認執行按鈕
                     if "adjusted" in action and not executed and not r["auto_execute"]:
                         if st.button(
                             f"✅ 確認調價至 £{target:.2f}",
@@ -630,7 +720,6 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
                             if token:
                                 success = update_item_price(r["item_id"], target, token, ep)
                                 if success:
-                                    # 更新 log
                                     logs = get_repricer_log(user_id, 50)
                                     pending = next(
                                         (l for l in logs
@@ -639,8 +728,6 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
                                     )
                                     if pending:
                                         execute_log_item(user_id, pending["id"])
-
-                                    # Telegram
                                     s = r["setting"]
                                     if s.get("notify_telegram") and s.get("telegram_token"):
                                         send_telegram(
@@ -662,6 +749,8 @@ def render_repricer_tab(user_id: str, listings: list, get_token_fn, ep: dict):
                         st.warning("⚠️ 低於底線，已跳過")
                     elif "already_competitive" in action:
                         st.info("✅ 你的價格已具競爭力，無需調整")
+                    elif "no_competitors" in action:
+                        st.info("✅ 找不到競爭對手，你是市場唯一賣家")
 
     # ════════════════════════════════
     # 子頁三：調價記錄
