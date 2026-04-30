@@ -42,7 +42,7 @@ CFG = get_config()
 # ─────────────────────────────────────────────
 # 環境切換 ← 改這一行切換 sandbox/production
 # ─────────────────────────────────────────────
-EBAY_ENV = "sandbox"  # 改為 "production" 切換正式環境
+EBAY_ENV = "production"  # 改為 "production" 切換正式環境
 
 EBAY_ENDPOINTS = {
     "sandbox": {
