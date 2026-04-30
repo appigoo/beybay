@@ -39,12 +39,24 @@ def get_config():
 
 CFG = get_config()
 
-# eBay Sandbox 端點
-EP = {
-    "auth":  "https://auth.sandbox.ebay.com/oauth2/authorize",
-    "token": "https://api.sandbox.ebay.com/identity/v1/oauth2/token",
-    "api":   "https://api.sandbox.ebay.com",
+# ─────────────────────────────────────────────
+# 環境切換 ← 改這一行切換 sandbox/production
+# ─────────────────────────────────────────────
+EBAY_ENV = "production"  # 改為 "production" 切換正式環境
+
+EBAY_ENDPOINTS = {
+    "sandbox": {
+        "auth":  "https://auth.sandbox.ebay.com/oauth2/authorize",
+        "token": "https://api.sandbox.ebay.com/identity/v1/oauth2/token",
+        "api":   "https://api.sandbox.ebay.com",
+    },
+    "production": {
+        "auth":  "https://auth.ebay.com/oauth2/authorize",
+        "token": "https://api.ebay.com/identity/v1/oauth2/token",
+        "api":   "https://api.ebay.com",
+    },
 }
+EP = EBAY_ENDPOINTS[EBAY_ENV]
 
 SCOPES = " ".join([
     "https://api.ebay.com/oauth/api_scope",
