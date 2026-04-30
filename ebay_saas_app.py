@@ -42,7 +42,7 @@ CFG = get_config()
 # ─────────────────────────────────────────────
 # 環境切換 ← 改這一行切換 sandbox/production
 # ─────────────────────────────────────────────
-EBAY_ENV = "production"  # 改為 "production" 切換正式環境
+EBAY_ENV = "sandbox"  # 改為 "production" 切換正式環境
 
 EBAY_ENDPOINTS = {
     "sandbox": {
@@ -219,13 +219,18 @@ def get_valid_token() -> str | None:
     if not st.session_state.access_token_enc:
         return None
 
+    from datetime import timezone
+
     # 檢查是否快到期
     if st.session_state.token_expiry:
         expiry = datetime.fromisoformat(st.session_state.token_expiry) \
             if isinstance(st.session_state.token_expiry, str) \
             else st.session_state.token_expiry
 
-        if datetime.now() >= expiry:
+        # 統一時區處理
+        now = datetime.now(timezone.utc) if expiry.tzinfo else datetime.now()
+
+        if now >= expiry:
             # 自動刷新
             refresh_tok = decrypt(st.session_state.refresh_token_enc)
             result = refresh_token_fn(refresh_tok)
@@ -510,7 +515,13 @@ def page_dashboard():
         if expiry:
             if isinstance(expiry, str):
                 expiry = datetime.fromisoformat(expiry)
-            remaining = max(0, int((expiry - datetime.now()).total_seconds() // 60))
+            # 統一處理時區：如果 expiry 有時區就用 UTC now，否則用 naive now
+            from datetime import timezone
+            if expiry.tzinfo is not None:
+                now = datetime.now(timezone.utc)
+            else:
+                now = datetime.now()
+            remaining = max(0, int((expiry - now).total_seconds() // 60))
             st.success(f"✅ eBay 已授權 | Token 剩餘 {remaining} 分鐘（到期自動刷新）")
     else:
         st.warning("⚠️ 尚未連接 eBay 帳號")
